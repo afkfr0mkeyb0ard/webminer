@@ -48,8 +48,7 @@ FALLBACK_HEADERS = [
 PROBE_VALUES = ["1", "true", "false", "test_marker_xyz123","'"]
 
 # User-Agent sent with every request (can be overridden with --user-agent).
-DEFAULT_USER_AGENT = ("Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:157.0) "
-                      "Gecko/20100101 Firefox/157.0")
+DEFAULT_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64; rv:160.0) Gecko/20100101 Firefox/160.0")
 
 # Serializes console output across worker threads so lines from
 # different candidates don't interleave mid-line.
