@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import NewConnectionError
 
 
 # --- Candidate wordlists -----------------------------------------------
@@ -44,7 +45,11 @@ FALLBACK_HEADERS = [
 
 # Values to try per candidate — increases the chance a parameter that
 # only reacts to specific values (e.g. a boolean gate) gets triggered.
-PROBE_VALUES = ["1", "true", "0", "false", "test_marker_xyz123"]
+PROBE_VALUES = ["1", "true", "false", "test_marker_xyz123","'"]
+
+# User-Agent sent with every request (can be overridden with --user-agent).
+DEFAULT_USER_AGENT = ("Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:157.0) "
+                      "Gecko/20100101 Firefox/157.0")
 
 # Serializes console output across worker threads so lines from
 # different candidates don't interleave mid-line.
@@ -61,7 +66,8 @@ class HTTPDetector:
     def __init__(self, url, timeout=10, delay=0.3, method="GET",
                  baseline_samples=3, similarity_threshold=0.98,
                  length_tolerance=5, confirm_retries=2, threads=1,
-                 proxy=None, insecure=False):
+                 proxy=None, insecure=False,
+                 user_agent=DEFAULT_USER_AGENT, http_version="auto"):
         self.url = url
         self.timeout = timeout
         self.delay = delay
@@ -71,9 +77,22 @@ class HTTPDetector:
         self.length_tolerance = length_tolerance
         self.confirm_retries = confirm_retries
         self.threads = max(1, threads)
+        self.user_agent = user_agent
+        self.http_version = http_version   # "auto" | "1.1" | "2"
+        self._proxy = proxy
+        self._insecure = insecure
+
+        # Protocol actually in use. "auto" starts on HTTP/1.1 (requests)
+        # and only switches to HTTP/2 (httpx) if 1.1 can't be used.
+        self.protocol = "1.1"
+        self._h2_client = None
 
         self.session = requests.Session()
         self.session.trust_env = False
+
+        # Session-level header: applied to every request (baseline,
+        # probes, confirmations). Per-request headers are merged on top.
+        self.session.headers["User-Agent"] = user_agent
 
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
@@ -116,25 +135,41 @@ class HTTPDetector:
                 if line.strip() and not line.startswith("#")
             ]
 
-    def load_candidates(self, filename, default_file, fallback):
-        """Load candidates from a user-supplied file if given, otherwise
-        from the bundled default wordlist file, falling back to a small
-        embedded list if even that is missing."""
+    def load_candidates(self, filename, default_file, fallback,
+                        case_insensitive=False):
+        """Merge candidates from every source: the user-supplied file (if
+        any), the bundled default wordlist, and the embedded fallback
+        list. Duplicates are removed, keeping the first occurrence so the
+        user's own entries come first. HTTP header names are
+        case-insensitive, so they are deduplicated ignoring case."""
 
-        target = filename or default_file
+        sources = []
+        if filename:
+            sources.append(("user file", filename))
+        sources.append(("default wordlist", default_file))
 
-        try:
-            candidates = self._read_wordlist(target)
-            return candidates if candidates else fallback
+        merged = []
+        for label, path in sources:
+            try:
+                merged += self._read_wordlist(path)
+            except FileNotFoundError:
+                print(f"[!] {label} not found: {path}")
 
-        except FileNotFoundError:
-            if filename:
-                print(f"[!] File not found: {filename}. "
-                      "Using built-in fallback candidates.")
-            else:
-                print(f"[!] Default wordlist not found: {target}. "
-                      "Using built-in fallback candidates.")
-            return fallback
+        merged += fallback
+
+        seen = set()
+        unique = []
+        for item in merged:
+            key = item.lower() if case_insensitive else item
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+
+        removed = len(merged) - len(unique)
+        if removed:
+            print(f"[*] Removed {removed} duplicate candidate(s)")
+        return unique
 
     # --- request helpers ----------------------------------------------
 
@@ -148,9 +183,126 @@ class HTTPDetector:
         if headers:
             kwargs["headers"] = headers
 
+        if self.protocol == "2":
+            return self._send_h2(kwargs)
+
         if self.method == "GET":
             return self.session.get(self.url, **kwargs)
         return self.session.post(self.url, **kwargs)
+
+    # --- HTTP/2 support (httpx, only used as a fallback) --------------
+
+    def _switch_to_h2(self):
+        """Build an HTTP/2-only httpx client and make it the active one."""
+
+        try:
+            import httpx
+            import h2  # noqa: F401 - httpx needs it for http2=True
+        except ImportError:
+            raise ValueError(
+                "HTTP/2 needs the 'httpx' and 'h2' packages: "
+                "pip install 'httpx[http2]'"
+            ) from None
+
+        kwargs = dict(
+            http1=False, http2=True,
+            verify=not self._insecure,
+            trust_env=False,
+            timeout=self.timeout,
+            follow_redirects=False,
+            headers={"User-Agent": self.user_agent},
+            limits=httpx.Limits(max_connections=self.threads,
+                                max_keepalive_connections=self.threads),
+        )
+        if self._proxy:
+            try:
+                self._h2_client = httpx.Client(proxy=self._proxy, **kwargs)
+            except TypeError:  # httpx < 0.26
+                self._h2_client = httpx.Client(proxies=self._proxy, **kwargs)
+        else:
+            self._h2_client = httpx.Client(**kwargs)
+
+        self.protocol = "2"
+
+    def _send_h2(self, kwargs):
+        import httpx
+
+        request_kwargs = {"headers": kwargs.get("headers")}
+        params = kwargs.get("params")
+        data = kwargs.get("data")
+
+        if params is not None:
+            # httpx replaces the URL's own query string when params= is
+            # given (requests appends); merge so behaviour stays the same.
+            request_kwargs["params"] = httpx.URL(self.url).params.merge(params)
+        if data is not None:
+            request_kwargs["data"] = data
+
+        try:
+            return self._h2_client.request(self.method, self.url,
+                                           **request_kwargs)
+        except httpx.HTTPError as error:
+            # Keep the rest of the script on a single exception type.
+            raise requests.RequestException(
+                f"{error.__class__.__name__}: {error}") from error
+
+    @staticmethod
+    def _protocol_label(response):
+        version = getattr(response, "http_version", None)  # httpx
+        if version:
+            return version
+        raw = getattr(getattr(response, "raw", None), "version", None)
+        return {10: "HTTP/1.0", 11: "HTTP/1.1"}.get(raw, "HTTP/1.1")
+
+    def _first_baseline_request(self):
+        """Send the very first request and settle on a protocol.
+
+        auto: HTTP/1.1 first; fall back to HTTP/2 if the connection is
+        refused/reset at protocol level or the server answers 505.
+        1.1 / 2: no negotiation, use exactly what was asked."""
+
+        if self.http_version == "2":
+            self._switch_to_h2()
+            return self._send()
+
+        if self.http_version == "1.1":
+            return self._send()
+
+        original_error = None
+        original_response = None
+        try:
+            response = self._send()
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ProxyError,
+                requests.exceptions.Timeout):
+            raise  # not a protocol problem; HTTP/2 wouldn't help
+        except requests.ConnectionError as error:
+            # Refused connection / DNS failure: the host is simply not
+            # reachable, HTTP/2 won't change that.
+            cause = getattr(error.args[0], "reason", None) if error.args \
+                else None
+            if isinstance(cause, NewConnectionError):
+                raise
+            original_error = error
+            reason = (f"HTTP/1.1 connection dropped by server "
+                      f"({error.__class__.__name__})")
+        else:
+            if response.status_code != 505:
+                return response
+            original_response = response
+            reason = "server answered 505 (HTTP Version Not Supported)"
+
+        print(f"[!] {reason}; falling back to HTTP/2...")
+        try:
+            self._switch_to_h2()
+        except ValueError as missing:
+            # No HTTP/2 stack installed: keep what HTTP/1.1 gave us.
+            print(f"[!] {missing}")
+            if original_error is not None:
+                raise original_error
+            self.protocol = "1.1"
+            return original_response
+        return self._send()
 
     def _normalize(self, body: bytes) -> bytes:
         cleaned = body
@@ -175,7 +327,12 @@ class HTTPDetector:
 
         samples = []
         for i in range(self.baseline_samples):
-            response = self._send()
+            if i == 0:
+                response = self._first_baseline_request()
+                print(f"    Protocol: "
+                      f"{self._protocol_label(response)}")
+            else:
+                response = self._send()
             samples.append(response)
             if i < self.baseline_samples - 1:
                 time.sleep(self.delay)
@@ -434,6 +591,17 @@ def main():
                               "(useful with an interception proxy whose "
                               "CA isn't trusted)")
 
+    parser.add_argument("-A", "--user-agent", default=DEFAULT_USER_AGENT,
+                         help="User-Agent header sent with every request "
+                              "(default: Firefox 157 on Ubuntu)")
+
+    parser.add_argument("--http-version", choices=["auto", "1.1", "2"],
+                         default="auto",
+                         help="HTTP version: auto = HTTP/1.1, falling back "
+                              "to HTTP/2 only if 1.1 fails (default); "
+                              "1.1 or 2 to force one (HTTP/2 needs "
+                              "httpx[http2])")
+
     args = parser.parse_args()
 
     if args.threads < 1:
@@ -451,19 +619,24 @@ def main():
         threads=args.threads,
         proxy=args.proxy,
         insecure=args.insecure,
+        user_agent=args.user_agent,
+        http_version=args.http_version,
     )
 
     params = detector.load_candidates(
         args.params, DEFAULT_PARAMS_FILE, FALLBACK_PARAMS
     )
     headers = detector.load_candidates(
-        args.headers, DEFAULT_HEADERS_FILE, FALLBACK_HEADERS
+        args.headers, DEFAULT_HEADERS_FILE, FALLBACK_HEADERS,
+        case_insensitive=True,
     )
 
     print("[*] HTTP Surface Detector")
     print(f"[*] Target: {args.url}")
     print(f"[*] Method: {args.method}")
     print(f"[*] Threads: {args.threads}")
+    print(f"[*] User-Agent: {args.user_agent}")
+    print(f"[*] HTTP version: {args.http_version}")
     if args.proxy:
         print(f"[*] Proxy: {args.proxy}"
               + (" (TLS verification disabled)" if args.insecure else ""))
